@@ -175,9 +175,7 @@ let timer = 0, score = 0, lives = 3, best = 0;
 let side = 1;                 // -1: gun points to your left, +1: to your right
 let drawT = 0;                // 0 holstered .. 1 aimed
 let aimedT = 0, escapedAt = -1;
-let twitch = 0, twitchAt = -1, centerHold = 0;
-// fake draw: he yanks the gun half out of the holster and slides it back
-let fakeAt = -1, fakeClock = -1, sinceFake = 99, fakeT = 0;
+let centerHold = 0;
 // the next shot's side is picked as soon as the previous shot fires, and the sun shows it
 const pickSide = () => Math.random() < 0.5 ? -1 : 1;
 let nextSide = pickSide();
@@ -193,28 +191,13 @@ function startGame() {
   overlay.classList.add('hidden');
 }
 
-function toCenter() { state = 'center'; centerHold = 0; drawT = 0; fakeClock = -1; fakeT = 0; }
+function toCenter() { state = 'center'; centerHold = 0; drawT = 0; }
 
 function newTense() {
   state = 'tense';
   const d = Math.min(1, score / 15);
   timer = 1 + Math.random() * (3 - d);
-  // small finger twitch once you have a few points
-  twitchAt = score >= 3 && Math.random() < 0.3 + d * 0.4 ? timer * (0.3 + Math.random() * 0.5) : -1;
-  // half-draw fake: leave at least 0.5s after it before the real draw
-  fakeAt = -1; fakeClock = -1; sinceFake = 99; fakeT = 0;
-  if (score >= 1 && Math.random() < 0.35 + d * 0.35) {
-    timer += 0.9;
-    fakeAt = 0.5 + Math.random() * (timer - 1.4);
-  }
   side = nextSide;
-}
-
-function fooled() {
-  lives--; hitFlash = 0.5; shake = 0.2;
-  showMsg('속았다!', '페이크에 움직였어요');
-  if (lives <= 0) { state = 'gap'; timer = 99; setTimeout(gameOver, 1000); return; }
-  toCenter();
 }
 
 function startDraw() {
@@ -279,7 +262,6 @@ function update(dt) {
   updateInput(dt);
   flash = Math.max(0, flash - dt); shake = Math.max(0, shake - dt);
   hitFlash = Math.max(0, hitFlash - dt); msgT = Math.max(0, msgT - dt * 0.9);
-  twitch = Math.max(0, twitch - dt * 5);
 
   if (state === 'ready') {
     timer -= dt;
@@ -288,21 +270,8 @@ function update(dt) {
     centerHold = Math.abs(head.x) < CENTER_X && faceSeen ? centerHold + dt : 0;
     if (centerHold > 0.4) newTense();
   } else if (state === 'tense') {
-    if (Math.abs(head.x) > EARLY_X) {
-      // flinching at a fake (or right after one) costs a life; other early moves just restart the round
-      if (fakeClock >= 0 || sinceFake < 0.5) return fooled();
-      showMsg('움직이지 마!', '가운데로 돌아오세요'); toCenter(); return;
-    }
+    if (Math.abs(head.x) > EARLY_X) { showMsg('움직이지 마!', '가운데로 돌아오세요'); toCenter(); return; }
     timer -= dt;
-    if (twitchAt >= 0 && timer <= twitchAt) { twitch = 1; twitchAt = -1; }
-    if (fakeAt >= 0 && timer <= fakeAt) { fakeAt = -1; fakeClock = 0; whoosh(); }
-    if (fakeClock >= 0) {
-      fakeClock += dt;
-      const c = fakeClock;
-      fakeT = c < 0.07 ? c / 0.07 : c < 0.22 ? 1 : c < 0.42 ? 1 - (c - 0.22) / 0.2 : 0;
-      drawT = fakeT * 0.3;
-      if (c >= 0.42) { fakeClock = -1; sinceFake = 0; }
-    } else sinceFake += dt;
     if (timer <= 0) startDraw();
   } else if (state === 'draw') {
     drawT = Math.min(1, drawT + dt / DRAW_TIME);
@@ -413,7 +382,7 @@ function drawGrip(p) {
 function drawArmAndGun() {
   drawHolster();
   // hand path: hovering over the holster -> extended toward you
-  const hover = { x: HIP.x + 0.04, y: HIP.y + 0.18 + twitch * 0.06, z: HIP.z - 0.05 };
+  const hover = { x: HIP.x + 0.04, y: HIP.y + 0.18, z: HIP.z - 0.05 };
   const t = 1 - Math.pow(1 - drawT, 3);
   const hand = { x: lerp(hover.x, AIM_HAND.x, t), y: lerp(hover.y, AIM_HAND.y, t), z: lerp(hover.z, AIM_HAND.z, t) };
   const ps = proj(SHOULDER.x, SHOULDER.y, SHOULDER.z), ph = proj(hand.x, hand.y, hand.z);
@@ -438,9 +407,7 @@ function drawArmAndGun() {
   // gun direction: from pointing down (in the holster) to the chosen side of your head
   const target = { x: side * 0.5, y: 0.05, z: 0 };
   const down = { x: hand.x, y: -3, z: hand.z - 0.3 };
-  // a fake half-draw keeps the barrel pointing down so it never gives away the side
-  const at = state === 'tense' ? 0 : t;
-  const aimPt = { x: lerp(down.x, target.x, at), y: lerp(down.y, target.y, at), z: lerp(down.z, target.z, at) };
+  const aimPt = { x: lerp(down.x, target.x, t), y: lerp(down.y, target.y, t), z: lerp(down.z, target.z, t) };
   const base = { x: hand.x, y: hand.y + 0.06, z: hand.z - 0.05 };
   const d = norm({ x: aimPt.x - base.x, y: aimPt.y - base.y, z: aimPt.z - base.z });
 
@@ -557,7 +524,7 @@ function draw() {
   drawHUD();
 }
 
-if (new URLSearchParams(location.search).has('debug')) window.game = { get state() { return state; }, get side() { return side; }, get nextSide() { return nextSide; }, get fakeClock() { return fakeClock; }, set score(v) { score = v; }, step(dt) { update(dt); draw(); }, get score() { return score; }, get lives() { return lives; } };
+if (new URLSearchParams(location.search).has('debug')) window.game = { get state() { return state; }, get side() { return side; }, get nextSide() { return nextSide; }, set score(v) { score = v; }, step(dt) { update(dt); draw(); }, get score() { return score; }, get lives() { return lives; } };
 
 let last = performance.now();
 function loop(now) {
