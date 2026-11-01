@@ -27,21 +27,24 @@
 <video id="cam" autoplay playsinline muted></video>
 <div id="overlay">
   <h1>총구를 피해라</h1>
-  <p id="desc">카우보이가 <b>당신을</b> 겨누고 있습니다.<br>
-  총구가 흔들리다가 <b>구멍이 정확히 동그랗게 보이는 순간</b> — 당신을 조준한 겁니다.<br>
-  <b>0.2초</b> 안에 머리를 움직여 피하세요! (좌우로 비키거나 숙이기)<br>
-  <small>웹캠이 얼굴 위치를 인식해요. 카메라에서 1m 정도 떨어져 앉으세요.</small></p>
+  <p id="desc">카우보이가 총을 <b>허리춤 총집</b>에 넣고 당신을 노려봅니다.<br>
+  갑자기 총을 뽑아 <b>왼쪽이나 오른쪽</b>을 겨누면 —<br>
+  <b>0.2초</b> 안에 얼굴을 <b>총구 반대 방향</b>으로 피하세요!<br>
+  <small>매 판 시작 전엔 얼굴을 가운데에 두세요. 미리 움직이면 카우보이가 기다립니다.<br>
+  웹캠이 얼굴 위치를 인식해요. 카메라에서 1m 정도 떨어져 앉으세요.</small></p>
   <button id="start">카메라로 시작</button>
-  <button id="keys" class="secondary">카메라 없이 (방향키)</button>
+  <button id="keys" class="secondary">카메라 없이 (← → 키)</button>
   <div id="status"></div>
 </div>
 
 <script type="module">
 import { FaceDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 
-// reaction window in seconds (override with ?t=0.3)
+// reaction window in seconds, counted from the moment the gun is aimed (override with ?t=0.3)
 const REACT = +(new URLSearchParams(location.search).get('t')) || 0.2;
-const HIT_R = 0.13;          // metres: head must leave this radius around the locked aim
+const DRAW_TIME = 0.09;      // holster -> aimed animation
+const SAFE_X = 0.12;         // metres the head must be on the safe side when he fires
+const CENTER_X = 0.07;       // "in the middle" tolerance between rounds
 const COWBOY_Z = 3.2;
 
 const cv = document.getElementById('game');
@@ -68,7 +71,7 @@ resize();
 
 // ---------- head tracking ----------
 // head = player's eye position in metres, relative to the neutral spot (x right, y up)
-const head = { x: 0, y: 0 };      // raw, used for hit tests
+const head = { x: 0, y: 0 };      // raw, used for judging
 const view = { x: 0, y: 0 };      // smoothed, used for the camera
 let detector = null, useCamera = false, faceSeen = true, lastVideoTime = -1;
 const keys = {};
@@ -94,6 +97,10 @@ async function initCamera() {
 }
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+
+// the middle of the frame is calibrated at the start of each game
+let calib = { x: 0.5, y: 0.42 }, rawFace = null;
 
 function updateInput(dt) {
   if (useCamera && detector && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
@@ -101,22 +108,20 @@ function updateInput(dt) {
     const res = detector.detectForVideo(video, performance.now());
     if (res.detections.length) {
       const b = res.detections[0].boundingBox;
-      const cx = (b.originX + b.width / 2) / video.videoWidth;
-      const cy = (b.originY + b.height / 2) / video.videoHeight;
-      head.x = clamp((0.5 - cx) * 1.4, -0.6, 0.6);   // mirrored
-      head.y = clamp((0.42 - cy) * 1.0, -0.4, 0.3);
+      rawFace = { x: (b.originX + b.width / 2) / video.videoWidth, y: (b.originY + b.height / 2) / video.videoHeight };
+      head.x = clamp((calib.x - rawFace.x) * 1.4, -0.6, 0.6);   // mirrored
+      head.y = clamp((calib.y - rawFace.y) * 1.0, -0.4, 0.3);
       faceSeen = true;
     } else {
       faceSeen = false;
     }
   }
   if (!useCamera) {
-    const sp = 3 * dt;
-    if (keys['ArrowLeft']) head.x -= sp;
-    if (keys['ArrowRight']) head.x += sp;
-    if (keys['ArrowDown']) head.y -= sp; else if (keys['ArrowUp']) head.y += sp;
-    else head.y += (0 - head.y) * Math.min(1, dt * 6);
-    head.x = clamp(head.x, -0.6, 0.6); head.y = clamp(head.y, -0.4, 0.3);
+    // arrow keys lean you to a side; release to come back to the middle
+    const tx = keys['ArrowLeft'] ? -0.35 : keys['ArrowRight'] ? 0.35 : 0;
+    const step = 6 * dt;
+    head.x += clamp(tx - head.x, -step, step);
+    head.y = 0;
   }
   const k = Math.min(1, dt * 30);
   view.x += (head.x - view.x) * k; view.y += (head.y - view.y) * k;
@@ -130,52 +135,51 @@ function proj(x, y, z) {
 const norm = v => { const l = Math.hypot(v.x, v.y, v.z) || 1; return { x: v.x / l, y: v.y / l, z: v.z / l }; };
 
 // ---------- game state ----------
-let state = 'menu';          // menu | ready | stalk | lock | gap | over
+// menu | ready | center | tense | draw | aimed | gap | over
+let state = 'menu';
 let timer = 0, score = 0, lives = 3, best = 0;
-const aim = { x: 0, y: 0 };      // point (z=0 plane) the barrel points at
-let wander = { x: 0.3, y: 0 }, wanderT = 0;
-let lockPt = null, lockTime = 0, escapedAt = -1;
-let flash = 0, shake = 0, hitFlash = 0, hammer = 0, crack = null;
+let side = 1;                 // -1: gun points to your left, +1: to your right
+let drawT = 0;                // 0 holstered .. 1 aimed
+let aimedT = 0, escapedAt = -1;
+let twitch = 0, twitchAt = -1, centerHold = 0;
+let flash = 0, shake = 0, hitFlash = 0, crack = null;
 let msg = '', sub = '', msgT = 0;
 let reactions = [];
-try { best = +localStorage.getItem('cowboy-fp-best') || 0; } catch {}
+try { best = +localStorage.getItem('cowboy-draw-best') || 0; } catch {}
 
 function startGame() {
-  score = 0; lives = 3; reactions = []; crack = null;
+  score = 0; lives = 3; reactions = []; crack = null; drawT = 0;
+  if (useCamera && rawFace) calib = { ...rawFace };
   state = 'ready'; timer = 2;
   overlay.classList.add('hidden');
 }
 
-function newStalk() {
-  state = 'stalk';
-  const d = Math.min(1, score / 20);
-  timer = 1.2 + Math.random() * (2.8 - d * 1.2);
-  pickWander();
-}
-function pickWander() {
-  const a = Math.random() * Math.PI * 2, r = 0.22 + Math.random() * 0.35;
-  wander = { x: Math.cos(a) * r, y: Math.sin(a) * r * 0.6 };
-  wanderT = 0.25 + Math.random() * 0.5;
+function toCenter() { state = 'center'; centerHold = 0; drawT = 0; }
+
+function newTense() {
+  state = 'tense';
+  const d = Math.min(1, score / 15);
+  timer = 1 + Math.random() * (3 - d);
+  // fake twitch once you have a few points
+  twitchAt = score >= 3 && Math.random() < 0.3 + d * 0.4 ? timer * (0.3 + Math.random() * 0.5) : -1;
 }
 
-function lockOn() {
-  state = 'lock';
-  lockPt = { x: head.x, y: head.y };
-  aim.x = lockPt.x; aim.y = lockPt.y;
-  lockTime = 0; escapedAt = -1;
-  hammer = 1;
-  click();
+function startDraw() {
+  state = 'draw';
+  side = Math.random() < 0.5 ? -1 : 1;
+  drawT = 0;
+  whoosh();
 }
 
 function fire() {
   flash = 0.1; shake = 0.35;
   bang();
-  const dist = Math.hypot(head.x - lockPt.x, head.y - lockPt.y);
-  if (dist < HIT_R) {
+  const safe = head.x * -side > SAFE_X;
+  if (!safe) {
     lives--; hitFlash = 0.7;
-    crack = { x: W / 2, y: H / 2, seed: Math.random() * 1000 };
-    showMsg('맞았다!', `${REACT}초 안에 피하지 못했어요`);
-    if (lives <= 0) { state = 'gap'; timer = 1; setTimeout(gameOver, 900); return; }
+    crack = { x: W / 2 + side * W * 0.12, y: H * 0.45, seed: Math.random() * 1000 };
+    const towards = head.x * side > SAFE_X;
+    showMsg('맞았다!', towards ? '총구 쪽으로 피했어요! 반대로!' : `${REACT}초 안에 피하지 못했어요`);
   } else {
     score++;
     const rt = escapedAt >= 0 ? escapedAt : REACT;
@@ -183,12 +187,13 @@ function fire() {
     showMsg(['피했다!', '빠르다!', '아슬아슬!', '총알보다 빨라!'][Math.floor(Math.random() * 4)], `반응 ${rt.toFixed(3)}초`);
   }
   state = 'gap';
-  timer = 1.1;
+  timer = 1.2;
+  if (lives <= 0) setTimeout(gameOver, 1000);
 }
 
 function gameOver() {
   state = 'over';
-  if (score > best) { best = score; try { localStorage.setItem('cowboy-fp-best', best); } catch {} }
+  if (score > best) { best = score; try { localStorage.setItem('cowboy-draw-best', best); } catch {} }
   const avg = reactions.length ? (reactions.reduce((a, b) => a + b, 0) / reactions.length).toFixed(3) + '초' : '-';
   titleEl.textContent = '쓰러졌다...';
   descEl.innerHTML = `피한 총알 <b>${score}</b>발 · 평균 반응 <b>${avg}</b><br>최고 기록 <b>${best}</b>발`;
@@ -203,56 +208,53 @@ function showMsg(t, s = '') { msg = t; sub = s; msgT = 1; }
 // ---------- sound ----------
 let actx = null;
 function audio() { return actx = actx || new AudioContext(); }
-function click() {
+function noise(dur, vol, curve, freq) {
   try {
-    const a = audio(), o = a.createOscillator(), g = a.createGain();
-    o.type = 'square'; o.frequency.value = 1800;
-    g.gain.setValueAtTime(0.12, a.currentTime); g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + 0.03);
-    o.connect(g).connect(a.destination); o.start(); o.stop(a.currentTime + 0.04);
+    const a = audio(), len = a.sampleRate * dur, buf = a.createBuffer(1, len, a.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, curve);
+    const src = a.createBufferSource(), g = a.createGain(), f = a.createBiquadFilter();
+    f.type = 'bandpass'; f.frequency.value = freq;
+    src.buffer = buf; g.gain.value = vol;
+    src.connect(f).connect(g).connect(a.destination); src.start();
   } catch {}
 }
-function bang() {
-  try {
-    const a = audio(), len = a.sampleRate * 0.35, buf = a.createBuffer(1, len, a.sampleRate), d = buf.getChannelData(0);
-    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3);
-    const src = a.createBufferSource(), g = a.createGain();
-    src.buffer = buf; g.gain.value = 0.6;
-    src.connect(g).connect(a.destination); src.start();
-  } catch {}
-}
+const bang = () => noise(0.4, 1.2, 3, 900);
+const whoosh = () => noise(0.08, 0.3, 1, 3000);
 
 // ---------- update ----------
 function update(dt) {
   updateInput(dt);
   flash = Math.max(0, flash - dt); shake = Math.max(0, shake - dt);
   hitFlash = Math.max(0, hitFlash - dt); msgT = Math.max(0, msgT - dt * 0.9);
-  hammer = Math.max(0, hammer - dt * 2);
+  twitch = Math.max(0, twitch - dt * 5);
 
   if (state === 'ready') {
-    timer -= dt; aim.x += (head.x + 0.4 - aim.x) * dt * 3; aim.y += (head.y - 0.3 - aim.y) * dt * 3;
-    if (timer <= 0) newStalk();
-  } else if (state === 'stalk') {
-    // barrel drifts around you, never quite on you
-    wanderT -= dt; if (wanderT <= 0) pickWander();
-    const tx = head.x + wander.x, ty = head.y + wander.y;
-    const k = Math.min(1, dt * 7);
-    aim.x += (tx - aim.x) * k; aim.y += (ty - aim.y) * k;
     timer -= dt;
-    if (timer <= 0) lockOn();
-  } else if (state === 'lock') {
-    lockTime += dt;
-    if (escapedAt < 0 && Math.hypot(head.x - lockPt.x, head.y - lockPt.y) >= HIT_R) escapedAt = lockTime;
-    if (lockTime >= REACT) fire();
+    if (timer <= 0) toCenter();
+  } else if (state === 'center') {
+    centerHold = Math.abs(head.x) < CENTER_X && faceSeen ? centerHold + dt : 0;
+    if (centerHold > 0.4) newTense();
+  } else if (state === 'tense') {
+    if (Math.abs(head.x) > CENTER_X * 1.6) { showMsg('움직이지 마!', '가운데로 돌아오세요'); toCenter(); return; }
+    timer -= dt;
+    if (twitchAt >= 0 && timer <= twitchAt) { twitch = 1; twitchAt = -1; }
+    if (timer <= 0) startDraw();
+  } else if (state === 'draw') {
+    drawT = Math.min(1, drawT + dt / DRAW_TIME);
+    if (drawT >= 1) { state = 'aimed'; aimedT = 0; escapedAt = -1; }
+  } else if (state === 'aimed') {
+    aimedT += dt;
+    if (escapedAt < 0 && head.x * -side > SAFE_X) escapedAt = aimedT;
+    if (aimedT >= REACT) fire();
   } else if (state === 'gap') {
     timer -= dt;
-    aim.x += (head.x + 0.5 - aim.x) * dt * 4; aim.y += (head.y - 0.5 - aim.y) * dt * 4;
-    if (timer <= 0 && lives > 0) newStalk();
+    if (timer <= 0 && lives > 0) toCenter();
   }
 }
 
 // ---------- drawing ----------
 function drawWorld() {
-  const hor = proj(0, -1.6 + 0, 1e4).y; // horizon (eye level is y=0, ground 1.6m below)
+  const hor = proj(0, -1.6, 1e4).y;
   const sky = ctx.createLinearGradient(0, 0, 0, hor);
   sky.addColorStop(0, '#e9763a'); sky.addColorStop(0.7, '#f6c26b'); sky.addColorStop(1, '#fbe2a8');
   ctx.fillStyle = sky; ctx.fillRect(0, 0, W, hor + 2);
@@ -260,7 +262,6 @@ function drawWorld() {
   const sun = proj(-14, 3, 80);
   ctx.fillStyle = '#fff1c1'; ctx.beginPath(); ctx.arc(sun.x, sun.y, F * 0.05, 0, Math.PI * 2); ctx.fill();
 
-  // distant mesas (parallax)
   ctx.fillStyle = '#b5552e';
   const mesa = (x0, x1, h, z) => {
     const a = proj(x0, -1.6, z), b = proj(x1, -1.6 + h, z);
@@ -272,40 +273,38 @@ function drawWorld() {
   g.addColorStop(0, '#d99a55'); g.addColorStop(1, '#8f5326');
   ctx.fillStyle = g; ctx.fillRect(0, hor, W, H - hor);
 
-  // a cactus for depth
-  const c = proj(-2.2, -1.6, 7);
+  const c = proj(-2.2, -1.6, 7), u = c.s;
   ctx.fillStyle = '#4f7a3a';
-  const u = c.s;
   ctx.fillRect(c.x - 0.12 * u, c.y - 1.6 * u, 0.24 * u, 1.6 * u);
   ctx.fillRect(c.x - 0.45 * u, c.y - 1.1 * u, 0.33 * u, 0.16 * u);
   ctx.fillRect(c.x - 0.45 * u, c.y - 1.45 * u, 0.16 * u, 0.5 * u);
 }
 
 function drawCowboy() {
-  const z = COWBOY_Z;
-  const chest = proj(0, -0.35, z);
-  const s = chest.s / 135; // art units -> metres (art is ~135 units per metre)
+  const chest = proj(0, -0.35, COWBOY_Z);
+  const s = chest.s / 135; // art units -> metres (~135 units per metre)
   ctx.save(); ctx.translate(chest.x, chest.y); ctx.scale(s, s);
-  // legs (cut by bottom of screen usually)
   ctx.fillStyle = '#3a4a6b'; ctx.fillRect(-30, 70, 24, 140); ctx.fillRect(6, 70, 24, 140);
-  // torso + vest
   ctx.fillStyle = '#c9a36b'; ctx.fillRect(-40, -12, 80, 88);
   ctx.fillStyle = '#6b3a1e'; ctx.fillRect(-40, -12, 26, 88); ctx.fillRect(14, -12, 26, 88);
   ctx.fillStyle = '#e2b84a'; ctx.beginPath();
   for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + i * Math.PI / 5, r = i % 2 ? 4 : 9; ctx.lineTo(-27 + Math.cos(a) * r, 18 + Math.sin(a) * r); }
   ctx.fill();
-  ctx.fillStyle = '#3b2010'; ctx.fillRect(-40, 66, 80, 10);
+  // gun belt
+  ctx.fillStyle = '#3b2010'; ctx.fillRect(-42, 66, 84, 11);
+  ctx.fillStyle = '#e2b84a'; ctx.fillRect(-6, 66, 12, 11);
   // left arm hanging
   ctx.fillStyle = '#c9a36b'; ctx.fillRect(-56, -8, 18, 70);
+  ctx.fillStyle = '#e8b48a'; ctx.beginPath(); ctx.arc(-47, 66, 10, 0, Math.PI * 2); ctx.fill();
   // head
   ctx.fillStyle = '#e8b48a'; ctx.beginPath(); ctx.arc(0, -38, 28, 0, Math.PI * 2); ctx.fill();
   ctx.fillStyle = '#c4382a'; ctx.beginPath(); ctx.moveTo(-26, -30); ctx.lineTo(26, -30); ctx.lineTo(0, -4); ctx.fill();
-  // eyes follow the aim; squint when locked
-  const ex = clamp((aim.x - 0) * 8, -5, 5), ey = clamp(-(aim.y) * 6, -3, 3);
+  // eyes: stare at you, flick to the target on the draw
+  const look = state === 'draw' || state === 'aimed' ? side * 5 : clamp(view.x * 8, -4, 4);
+  const narrow = state === 'tense' || state === 'draw' || state === 'aimed';
   ctx.fillStyle = '#2b1a10';
-  const eh = state === 'lock' ? 2 : 4;
-  ctx.fillRect(-14 + ex, -46 + ey, 10, eh); ctx.fillRect(4 + ex, -46 + ey, 10, eh);
-  ctx.fillRect(-16, -54 + (state === 'lock' ? 3 : 0), 13, 3); ctx.fillRect(3, -54 + (state === 'lock' ? 3 : 0), 13, 3);
+  ctx.fillRect(-14 + look, -46, 10, narrow ? 2 : 4); ctx.fillRect(4 + look, -46, 10, narrow ? 2 : 4);
+  ctx.fillRect(-16, narrow ? -51 : -54, 13, 3); ctx.fillRect(3, narrow ? -51 : -54, 13, 3);
   // hat
   ctx.fillStyle = '#5a3418';
   ctx.beginPath(); ctx.ellipse(0, -60, 58, 11, 0, 0, Math.PI * 2); ctx.fill();
@@ -314,70 +313,97 @@ function drawCowboy() {
   ctx.restore();
 }
 
-function drawGun() {
-  // shoulder -> hand -> revolver; the arm reaches toward you
-  const shoulder = { x: 0.32, y: -0.38, z: COWBOY_Z };
-  const hand = { x: 0.14, y: -0.28, z: COWBOY_Z - 1.3 };
-  const gunBase = { x: hand.x, y: hand.y + 0.06, z: hand.z - 0.05 };
-  // exaggerate lateral error so "not on you" is easy to read; dead-on stays a perfect circle
-  const ex = 4;
-  const tx = view.x + (aim.x - view.x) * ex, ty = view.y + (aim.y - view.y) * ex;
-  const d = norm({ x: tx - gunBase.x, y: ty - gunBase.y, z: -gunBase.z });
+// holster sits on the cowboy's right hip (screen right)
+const HIP = { x: 0.36, y: -0.95, z: COWBOY_Z };
+const SHOULDER = { x: 0.32, y: -0.38, z: COWBOY_Z };
+const AIM_HAND = { x: 0.14, y: -0.28, z: COWBOY_Z - 1.3 };
 
-  const L = 0.22, R = 0.03;
-  const back = { x: gunBase.x - d.x * 0.03, y: gunBase.y - d.y * 0.03, z: gunBase.z - d.z * 0.03 };
-  const tip = { x: gunBase.x + d.x * L, y: gunBase.y + d.y * L, z: gunBase.z + d.z * L };
+function drawHolster() {
+  const p = proj(HIP.x, HIP.y, HIP.z), u = p.s;
+  ctx.fillStyle = '#5a3418';
+  ctx.beginPath();
+  ctx.moveTo(p.x - 0.06 * u, p.y - 0.05 * u); ctx.lineTo(p.x + 0.07 * u, p.y - 0.05 * u);
+  ctx.lineTo(p.x + 0.05 * u, p.y + 0.28 * u); ctx.lineTo(p.x - 0.02 * u, p.y + 0.3 * u); ctx.fill();
+  ctx.strokeStyle = '#e2b84a'; ctx.lineWidth = 0.008 * u; ctx.stroke();
+}
 
-  // arm
-  const ps = proj(shoulder.x, shoulder.y, shoulder.z), ph = proj(hand.x, hand.y, hand.z);
+function drawGrip(p) {
+  const u = p.s;
+  ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(-0.35);
+  ctx.fillStyle = '#4a2a14'; ctx.beginPath(); ctx.roundRect(-0.025 * u, -0.12 * u, 0.05 * u, 0.12 * u, 0.012 * u); ctx.fill();
+  ctx.fillStyle = '#5e646e'; ctx.fillRect(-0.03 * u, -0.01 * u, 0.06 * u, 0.04 * u);
+  ctx.restore();
+}
+
+function drawArmAndGun() {
+  drawHolster();
+  // hand path: hovering over the holster -> extended toward you
+  const hover = { x: HIP.x + 0.04, y: HIP.y + 0.18 + twitch * 0.06, z: HIP.z - 0.05 };
+  const t = 1 - Math.pow(1 - drawT, 3);
+  const hand = { x: lerp(hover.x, AIM_HAND.x, t), y: lerp(hover.y, AIM_HAND.y, t), z: lerp(hover.z, AIM_HAND.z, t) };
+  const ps = proj(SHOULDER.x, SHOULDER.y, SHOULDER.z), ph = proj(hand.x, hand.y, hand.z);
+
+  if (drawT === 0) drawGrip(proj(HIP.x, HIP.y + 0.02, HIP.z - 0.06));
+
   ctx.lineCap = 'round';
   ctx.strokeStyle = '#b8925c'; ctx.lineWidth = 0.13 * ph.s;
   ctx.beginPath(); ctx.moveTo(ps.x, ps.y); ctx.lineTo(ph.x, ph.y); ctx.stroke();
-  // hand + grip
+
+  if (drawT === 0) {
+    // twitchy fingers over the grip
+    ctx.fillStyle = '#e8b48a';
+    ctx.beginPath(); ctx.arc(ph.x, ph.y, 0.055 * ph.s, 0, Math.PI * 2); ctx.fill();
+    for (let i = 0; i < 4; i++) {
+      const wig = Math.sin(performance.now() / 90 + i) * 0.006 * (state === 'tense' ? 1 : 0.3);
+      ctx.fillRect(ph.x - 0.04 * ph.s + i * 0.022 * ph.s, ph.y + 0.03 * ph.s, 0.014 * ph.s, (0.05 + wig) * ph.s);
+    }
+    return;
+  }
+
+  // gun direction: from pointing down (in the holster) to the chosen side of your head
+  const target = { x: side * 0.5, y: 0.05, z: 0 };
+  const down = { x: hand.x, y: -3, z: hand.z - 0.3 };
+  const aimPt = { x: lerp(down.x, target.x, t), y: lerp(down.y, target.y, t), z: lerp(down.z, target.z, t) };
+  const base = { x: hand.x, y: hand.y + 0.06, z: hand.z - 0.05 };
+  const d = norm({ x: aimPt.x - base.x, y: aimPt.y - base.y, z: aimPt.z - base.z });
+
+  const L = 0.24, R = 0.03;
+  const tip = { x: base.x + d.x * L, y: base.y + d.y * L, z: base.z + d.z * L };
+  const pg = proj(base.x, base.y, base.z), pt = proj(tip.x, tip.y, tip.z);
+
+  // grip in hand
   ctx.fillStyle = '#4a2a14';
   ctx.beginPath(); ctx.ellipse(ph.x, ph.y + 0.02 * ph.s, 0.035 * ph.s, 0.07 * ph.s, 0, 0, Math.PI * 2); ctx.fill();
   ctx.fillStyle = '#e8b48a';
   ctx.beginPath(); ctx.arc(ph.x, ph.y, 0.055 * ph.s, 0, Math.PI * 2); ctx.fill();
 
-  // hammer (cocks back on lock)
-  const pb = proj(back.x, back.y, back.z);
-  ctx.fillStyle = '#3b3f46';
-  const hy = (0.05 + hammer * 0.03) * pb.s;
-  ctx.fillRect(pb.x - 0.01 * pb.s, pb.y - hy, 0.02 * pb.s, hy);
-
   // drum
-  const pg = proj(gunBase.x, gunBase.y, gunBase.z);
   ctx.fillStyle = '#5e646e';
-  ctx.beginPath(); ctx.arc(pg.x, pg.y, 0.045 * pg.s, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(pg.x, pg.y, 0.05 * pg.s, 0, Math.PI * 2); ctx.fill();
   ctx.fillStyle = '#464b53';
-  for (let i = 0; i < 6; i++) { const a = i * Math.PI / 3; ctx.beginPath(); ctx.arc(pg.x + Math.cos(a) * 0.028 * pg.s, pg.y + Math.sin(a) * 0.028 * pg.s, 0.008 * pg.s, 0, Math.PI * 2); ctx.fill(); }
+  for (let i = 0; i < 6; i++) { const a = i * Math.PI / 3; ctx.beginPath(); ctx.arc(pg.x + Math.cos(a) * 0.03 * pg.s, pg.y + Math.sin(a) * 0.03 * pg.s, 0.009 * pg.s, 0, Math.PI * 2); ctx.fill(); }
 
-  // barrel body (projected cylinder)
-  const pt = proj(tip.x, tip.y, tip.z);
+  // barrel
   ctx.strokeStyle = '#7d848f'; ctx.lineWidth = 2 * R * (pg.s + pt.s) / 2;
   ctx.beginPath(); ctx.moveTo(pg.x, pg.y); ctx.lineTo(pt.x, pt.y); ctx.stroke();
-  ctx.strokeStyle = 'rgba(255,255,255,.25)'; ctx.lineWidth = R * 0.5 * pt.s;
+  ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.lineWidth = R * 0.5 * pt.s;
   ctx.beginPath(); ctx.moveTo(pg.x, pg.y - R * 0.5 * pg.s); ctx.lineTo(pt.x, pt.y - R * 0.5 * pt.s); ctx.stroke();
 
-  // muzzle face: ellipse whose roundness = how directly it points at you
+  // muzzle face: rounder the more it faces you
   const v = norm({ x: view.x - tip.x, y: view.y - tip.y, z: -tip.z });
   const cosA = Math.max(0, d.x * v.x + d.y * v.y + d.z * v.z);
-  const ang = Math.atan2(pt.y - pg.y, pt.x - pg.x);
-  const r = R * pt.s;
+  const ang = Math.atan2(pt.y - pg.y, pt.x - pg.x), r = R * pt.s;
   ctx.save(); ctx.translate(pt.x, pt.y); ctx.rotate(ang);
   ctx.fillStyle = '#8f96a1';
   ctx.beginPath(); ctx.ellipse(0, 0, Math.max(1, r * cosA), r, 0, 0, Math.PI * 2); ctx.fill();
   ctx.fillStyle = '#0b0b0d';
   ctx.beginPath(); ctx.ellipse(0, 0, Math.max(0.5, r * 0.55 * cosA), r * 0.55, 0, 0, Math.PI * 2); ctx.fill();
   ctx.restore();
-  // front sight
-  ctx.fillStyle = '#5e646e';
-  ctx.fillRect(pt.x - 0.004 * pt.s, pt.y - r - 0.012 * pt.s, 0.008 * pt.s, 0.012 * pt.s);
 
   if (flash > 0) {
     ctx.fillStyle = `rgba(255,240,150,${flash * 10})`;
     ctx.beginPath();
-    for (let i = 0; i < 14; i++) { const a = i / 14 * Math.PI * 2, rr = (i % 2 ? 0.08 : 0.25) * pt.s; ctx.lineTo(pt.x + Math.cos(a) * rr, pt.y + Math.sin(a) * rr); }
+    for (let i = 0; i < 14; i++) { const a = i / 14 * Math.PI * 2, rr = (i % 2 ? 0.08 : 0.28) * pt.s; ctx.lineTo(pt.x + Math.cos(a) * rr, pt.y + Math.sin(a) * rr); }
     ctx.fill();
   }
 }
@@ -396,6 +422,12 @@ function drawCrack() {
   ctx.fillStyle = 'rgba(20,10,5,.8)'; ctx.beginPath(); ctx.arc(crack.x, crack.y, 10, 0, Math.PI * 2); ctx.fill();
 }
 
+function outlined(text, x, y, size, fill, font = 'Black Han Sans') {
+  ctx.font = `${size}px '${font}', sans-serif`;
+  ctx.fillStyle = fill; ctx.strokeStyle = '#2b1a10'; ctx.lineWidth = Math.max(3, size / 12);
+  ctx.strokeText(text, x, y); ctx.fillText(text, x, y);
+}
+
 function drawHUD() {
   ctx.textAlign = 'left'; ctx.textBaseline = 'top';
   ctx.font = `28px 'Black Han Sans', sans-serif`; ctx.fillStyle = '#2b1a10';
@@ -406,22 +438,25 @@ function drawHUD() {
   ctx.fillText('❤️'.repeat(Math.max(0, lives)) + '🖤'.repeat(Math.max(0, 3 - lives)), W - 18, 16);
 
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  if (state === 'ready') {
-    ctx.font = `${Math.min(W, H) * 0.1}px 'Black Han Sans', sans-serif`;
-    ctx.fillStyle = '#fff4e0'; ctx.strokeStyle = '#2b1a10'; ctx.lineWidth = 6;
-    const t = timer > 1 ? '준비...' : '결투!';
-    ctx.strokeText(t, W / 2, H * 0.8); ctx.fillText(t, W / 2, H * 0.8);
+  const m = Math.min(W, H);
+  if (state === 'ready') outlined(timer > 1 ? '준비...' : '결투!', W / 2, H * 0.82, m * 0.1, '#fff4e0');
+
+  // centre gauge: where your head is, and the middle zone you must return to
+  if (state !== 'menu' && state !== 'over') {
+    const gy = H - 40, gw = Math.min(W * 0.6, 420), gx = W / 2 - gw / 2;
+    ctx.fillStyle = 'rgba(43,26,16,.35)'; ctx.fillRect(gx, gy - 4, gw, 8);
+    const scale = gw / 1.2;
+    ctx.fillStyle = state === 'center' ? 'rgba(255,244,224,.8)' : 'rgba(255,244,224,.35)';
+    ctx.fillRect(W / 2 - CENTER_X * scale, gy - 10, CENTER_X * 2 * scale, 20);
+    ctx.fillStyle = '#c4382a';
+    ctx.beginPath(); ctx.arc(W / 2 + clamp(head.x, -0.6, 0.6) * scale, gy, 9, 0, Math.PI * 2); ctx.fill();
   }
+  if (state === 'center' && msgT <= 0) outlined('얼굴을 가운데로', W / 2, H * 0.82, m * 0.05, '#fff4e0');
+
   if (msgT > 0) {
     ctx.globalAlpha = Math.min(1, msgT * 2);
-    ctx.font = `${Math.min(W, H) * 0.08}px 'Black Han Sans', sans-serif`;
-    ctx.fillStyle = hitFlash > 0 ? '#ff6b5a' : '#fff4e0';
-    ctx.strokeStyle = '#2b1a10'; ctx.lineWidth = 6;
-    ctx.strokeText(msg, W / 2, H * 0.78); ctx.fillText(msg, W / 2, H * 0.78);
-    if (sub) {
-      ctx.font = `bold ${Math.min(W, H) * 0.035}px 'Noto Sans KR', sans-serif`; ctx.lineWidth = 4;
-      ctx.strokeText(sub, W / 2, H * 0.78 + Math.min(W, H) * 0.07); ctx.fillText(sub, W / 2, H * 0.78 + Math.min(W, H) * 0.07);
-    }
+    outlined(msg, W / 2, H * 0.78, m * 0.08, hitFlash > 0 ? '#ff6b5a' : '#fff4e0');
+    if (sub) outlined(sub, W / 2, H * 0.78 + m * 0.07, m * 0.035, '#fff4e0', 'Noto Sans KR');
     ctx.globalAlpha = 1;
   }
   if (useCamera && !faceSeen && state !== 'menu' && state !== 'over') {
@@ -435,17 +470,17 @@ function draw() {
   if (shake > 0) ctx.translate((Math.random() - .5) * 30 * shake, (Math.random() - .5) * 30 * shake);
   drawWorld();
   drawCowboy();
-  drawGun();
+  drawArmAndGun();
   ctx.restore();
   if (hitFlash > 0) { ctx.fillStyle = `rgba(196,40,30,${hitFlash * 0.6})`; ctx.fillRect(0, 0, W, H); }
-  if (hitFlash > 0 || state === 'gap') drawCrack();
-  if (state !== 'gap') crack = null;
-  // vignette
+  if (state === 'gap') drawCrack(); else crack = null;
   const vg = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.75);
   vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(30,10,0,.55)');
   ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
   drawHUD();
 }
+
+if (new URLSearchParams(location.search).has('debug')) window.game = { get state() { return state; }, get side() { return side; }, get score() { return score; }, get lives() { return lives; } };
 
 let last = performance.now();
 function loop(now) {
@@ -462,6 +497,8 @@ startBtn.addEventListener('click', async () => {
   try {
     await initCamera();
     statusEl.textContent = '';
+    // let the detector see the face once so the middle can be calibrated
+    for (let i = 0; i < 30 && !rawFace; i++) { updateInput(0); await new Promise(r => setTimeout(r, 50)); }
     startGame();
   } catch (e) {
     console.error(e);
