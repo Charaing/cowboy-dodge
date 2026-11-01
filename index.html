@@ -38,7 +38,6 @@
   <small>매 판 시작 전엔 얼굴을 가운데에 두세요. 미리 움직이면 카우보이가 기다립니다.<br>
   웹캠이 얼굴 위치를 인식해요. 카메라에서 1m 정도 떨어져 앉으세요.</small></p>
   <div class="opts"><span>반응 시간</span><div class="chips" id="reactOpts"></div></div>
-  <div class="opts"><span>얼굴 감도</span><div class="chips" id="sensOpts"></div></div>
   <button id="start">카메라로 시작</button>
   <button id="keys" class="secondary">카메라 없이 (← → 키)</button>
   <div id="status"></div>
@@ -53,8 +52,7 @@ const REACT_CHOICES = [0.15, 0.2, 0.3, 0.4, 0.5, 0.7];
 // camera frames arrive a few tens of ms late, so the camera mode gets that time back
 const CAM_LAG = 0.05;
 // how far (in metres of game space) one full camera-frame width of face movement takes you
-let GAIN = 3;
-const SENS_CHOICES = [['낮음', 2], ['보통', 3], ['높음', 4.5], ['아주 높음', 6]];
+const GAIN = 4.5;
 const DRAW_TIME = 0.09;      // holster -> aimed animation
 const SAFE_X = 0.12;         // metres the head must be on the safe side when he fires
 const CENTER_X = 0.08;       // "in the middle" tolerance between rounds
@@ -75,7 +73,6 @@ const titleEl = overlay.querySelector('h1');
 const params = new URLSearchParams(location.search);
 try {
   REACT = +localStorage.getItem('cowboy-react') || REACT;
-  GAIN = +localStorage.getItem('cowboy-gain') || GAIN;
 } catch {}
 if (+params.get('t')) REACT = +params.get('t');
 
@@ -94,8 +91,6 @@ function chips(el, items, isOn, pick) {
 }
 chips(document.getElementById('reactOpts'), REACT_CHOICES.map(v => [`${v}초`, v]), v => v === REACT,
   v => { REACT = v; try { localStorage.setItem('cowboy-react', v); } catch {} });
-chips(document.getElementById('sensOpts'), SENS_CHOICES, v => v === GAIN,
-  v => { GAIN = v; try { localStorage.setItem('cowboy-gain', v); } catch {} });
 
 let W = 0, H = 0, F = 0;
 function resize() {
@@ -181,6 +176,8 @@ let side = 1;                 // -1: gun points to your left, +1: to your right
 let drawT = 0;                // 0 holstered .. 1 aimed
 let aimedT = 0, escapedAt = -1;
 let twitch = 0, twitchAt = -1, centerHold = 0;
+// fake draw: he yanks the gun half out of the holster and slides it back
+let fakeAt = -1, fakeClock = -1, sinceFake = 99, fakeT = 0;
 // the next shot's side is picked as soon as the previous shot fires, and the sun shows it
 const pickSide = () => Math.random() < 0.5 ? -1 : 1;
 let nextSide = pickSide();
@@ -196,15 +193,28 @@ function startGame() {
   overlay.classList.add('hidden');
 }
 
-function toCenter() { state = 'center'; centerHold = 0; drawT = 0; }
+function toCenter() { state = 'center'; centerHold = 0; drawT = 0; fakeClock = -1; fakeT = 0; }
 
 function newTense() {
   state = 'tense';
   const d = Math.min(1, score / 15);
   timer = 1 + Math.random() * (3 - d);
-  // fake twitch once you have a few points
+  // small finger twitch once you have a few points
   twitchAt = score >= 3 && Math.random() < 0.3 + d * 0.4 ? timer * (0.3 + Math.random() * 0.5) : -1;
+  // half-draw fake: leave at least 0.5s after it before the real draw
+  fakeAt = -1; fakeClock = -1; sinceFake = 99; fakeT = 0;
+  if (score >= 1 && Math.random() < 0.35 + d * 0.35) {
+    timer += 0.9;
+    fakeAt = 0.5 + Math.random() * (timer - 1.4);
+  }
   side = nextSide;
+}
+
+function fooled() {
+  lives--; hitFlash = 0.5; shake = 0.2;
+  showMsg('속았다!', '페이크에 움직였어요');
+  if (lives <= 0) { state = 'gap'; timer = 99; setTimeout(gameOver, 1000); return; }
+  toCenter();
 }
 
 function startDraw() {
@@ -278,9 +288,21 @@ function update(dt) {
     centerHold = Math.abs(head.x) < CENTER_X && faceSeen ? centerHold + dt : 0;
     if (centerHold > 0.4) newTense();
   } else if (state === 'tense') {
-    if (Math.abs(head.x) > EARLY_X) { showMsg('움직이지 마!', '가운데로 돌아오세요'); toCenter(); return; }
+    if (Math.abs(head.x) > EARLY_X) {
+      // flinching at a fake (or right after one) costs a life; other early moves just restart the round
+      if (fakeClock >= 0 || sinceFake < 0.5) return fooled();
+      showMsg('움직이지 마!', '가운데로 돌아오세요'); toCenter(); return;
+    }
     timer -= dt;
     if (twitchAt >= 0 && timer <= twitchAt) { twitch = 1; twitchAt = -1; }
+    if (fakeAt >= 0 && timer <= fakeAt) { fakeAt = -1; fakeClock = 0; whoosh(); }
+    if (fakeClock >= 0) {
+      fakeClock += dt;
+      const c = fakeClock;
+      fakeT = c < 0.07 ? c / 0.07 : c < 0.22 ? 1 : c < 0.42 ? 1 - (c - 0.22) / 0.2 : 0;
+      drawT = fakeT * 0.3;
+      if (c >= 0.42) { fakeClock = -1; sinceFake = 0; }
+    } else sinceFake += dt;
     if (timer <= 0) startDraw();
   } else if (state === 'draw') {
     drawT = Math.min(1, drawT + dt / DRAW_TIME);
@@ -416,7 +438,9 @@ function drawArmAndGun() {
   // gun direction: from pointing down (in the holster) to the chosen side of your head
   const target = { x: side * 0.5, y: 0.05, z: 0 };
   const down = { x: hand.x, y: -3, z: hand.z - 0.3 };
-  const aimPt = { x: lerp(down.x, target.x, t), y: lerp(down.y, target.y, t), z: lerp(down.z, target.z, t) };
+  // a fake half-draw keeps the barrel pointing down so it never gives away the side
+  const at = state === 'tense' ? 0 : t;
+  const aimPt = { x: lerp(down.x, target.x, at), y: lerp(down.y, target.y, at), z: lerp(down.z, target.z, at) };
   const base = { x: hand.x, y: hand.y + 0.06, z: hand.z - 0.05 };
   const d = norm({ x: aimPt.x - base.x, y: aimPt.y - base.y, z: aimPt.z - base.z });
 
@@ -533,7 +557,7 @@ function draw() {
   drawHUD();
 }
 
-if (new URLSearchParams(location.search).has('debug')) window.game = { get state() { return state; }, get side() { return side; }, get nextSide() { return nextSide; }, get score() { return score; }, get lives() { return lives; } };
+if (new URLSearchParams(location.search).has('debug')) window.game = { get state() { return state; }, get side() { return side; }, get nextSide() { return nextSide; }, get fakeClock() { return fakeClock; }, set score(v) { score = v; }, step(dt) { update(dt); draw(); }, get score() { return score; }, get lives() { return lives; } };
 
 let last = performance.now();
 function loop(now) {
