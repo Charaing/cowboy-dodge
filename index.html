@@ -181,6 +181,9 @@ let side = 1;                 // -1: gun points to your left, +1: to your right
 let drawT = 0;                // 0 holstered .. 1 aimed
 let aimedT = 0, escapedAt = -1;
 let twitch = 0, twitchAt = -1, centerHold = 0;
+// the next shot's side is picked as soon as the previous shot fires, and the sun shows it
+const pickSide = () => Math.random() < 0.5 ? -1 : 1;
+let nextSide = pickSide();
 let flash = 0, shake = 0, hitFlash = 0, crack = null;
 let msg = '', sub = '', msgT = 0;
 let reactions = [];
@@ -201,11 +204,11 @@ function newTense() {
   timer = 1 + Math.random() * (3 - d);
   // fake twitch once you have a few points
   twitchAt = score >= 3 && Math.random() < 0.3 + d * 0.4 ? timer * (0.3 + Math.random() * 0.5) : -1;
+  side = nextSide;
 }
 
 function startDraw() {
   state = 'draw';
-  side = Math.random() < 0.5 ? -1 : 1;
   drawT = 0;
   whoosh();
 }
@@ -213,6 +216,7 @@ function startDraw() {
 function fire() {
   flash = 0.1; shake = 0.35;
   bang();
+  nextSide = pickSide();
   const safe = head.x * -side > SAFE_X;
   if (!safe) {
     lives--; hitFlash = 0.7;
@@ -298,8 +302,18 @@ function drawWorld() {
   sky.addColorStop(0, '#e9763a'); sky.addColorStop(0.7, '#f6c26b'); sky.addColorStop(1, '#fbe2a8');
   ctx.fillStyle = sky; ctx.fillRect(0, 0, W, hor + 2);
 
-  const sun = proj(-14, 3, 80);
-  ctx.fillStyle = '#fff1c1'; ctx.beginPath(); ctx.arc(sun.x, sun.y, F * 0.05, 0, Math.PI * 2); ctx.fill();
+  // tell for the next shot: sun touches the nearest mesa's slope = left, a hair apart = right
+  const sun = proj(-14, 3, 80), sunR = F * 0.05;
+  {
+    const a = proj(-30, -1.6, 60), b = proj(-16, 5.4, 60);
+    const p1 = { x: b.x, y: b.y }, p2 = { x: b.x + 30, y: a.y };
+    const lx = p2.x - p1.x, ly = p2.y - p1.y, ll = Math.hypot(lx, ly);
+    const nx = ly / ll, ny = -lx / ll;                     // outward normal of the slope
+    const d0 = (sun.x - p1.x) * nx + (sun.y - p1.y) * ny;  // signed distance of the sun centre
+    const want = nextSide < 0 ? sunR - 1 : sunR + Math.max(3, sunR * 0.08);
+    sun.x += (want - d0) / nx;
+  }
+  ctx.fillStyle = '#fff1c1'; ctx.beginPath(); ctx.arc(sun.x, sun.y, sunR, 0, Math.PI * 2); ctx.fill();
 
   ctx.fillStyle = '#b5552e';
   const mesa = (x0, x1, h, z) => {
@@ -519,7 +533,7 @@ function draw() {
   drawHUD();
 }
 
-if (new URLSearchParams(location.search).has('debug')) window.game = { get state() { return state; }, get side() { return side; }, get score() { return score; }, get lives() { return lives; } };
+if (new URLSearchParams(location.search).has('debug')) window.game = { get state() { return state; }, get side() { return side; }, get nextSide() { return nextSide; }, get score() { return score; }, get lives() { return lives; } };
 
 let last = performance.now();
 function loop(now) {
