@@ -20,6 +20,11 @@
   button:active { transform:translate(2px,2px); box-shadow:2px 2px 0 var(--ink); }
   button.secondary { font-size:16px; padding:8px 18px; background:var(--cream); }
   #status { font-size:14px; opacity:.8; min-height:20px; }
+  .opts { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:center; }
+  .opts > span { font-weight:700; color:var(--sand); min-width:72px; }
+  .chips { display:flex; gap:6px; flex-wrap:wrap; justify-content:center; }
+  .chips button { font-family:'Noto Sans KR',sans-serif; font-weight:700; font-size:15px; padding:6px 12px; box-shadow:2px 2px 0 var(--ink); background:var(--cream); }
+  .chips button.on { background:var(--red); color:var(--cream); }
 </style>
 </head>
 <body>
@@ -29,9 +34,11 @@
   <h1>총구를 피해라</h1>
   <p id="desc">카우보이가 총을 <b>허리춤 총집</b>에 넣고 당신을 노려봅니다.<br>
   갑자기 총을 뽑아 <b>왼쪽이나 오른쪽</b>을 겨누면 —<br>
-  <b>0.2초</b> 안에 얼굴을 <b>총구 반대 방향</b>으로 피하세요!<br>
+  <b>정해진 시간</b> 안에 얼굴을 <b>총구 반대 방향</b>으로 피하세요!<br>
   <small>매 판 시작 전엔 얼굴을 가운데에 두세요. 미리 움직이면 카우보이가 기다립니다.<br>
   웹캠이 얼굴 위치를 인식해요. 카메라에서 1m 정도 떨어져 앉으세요.</small></p>
+  <div class="opts"><span>반응 시간</span><div class="chips" id="reactOpts"></div></div>
+  <div class="opts"><span>얼굴 감도</span><div class="chips" id="sensOpts"></div></div>
   <button id="start">카메라로 시작</button>
   <button id="keys" class="secondary">카메라 없이 (← → 키)</button>
   <div id="status"></div>
@@ -41,10 +48,17 @@
 import { FaceDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 
 // reaction window in seconds, counted from the moment the gun is aimed (override with ?t=0.3)
-const REACT = +(new URLSearchParams(location.search).get('t')) || 0.2;
+let REACT = 0.2;
+const REACT_CHOICES = [0.15, 0.2, 0.3, 0.4, 0.5, 0.7];
+// camera frames arrive a few tens of ms late, so the camera mode gets that time back
+const CAM_LAG = 0.05;
+// how far (in metres of game space) one full camera-frame width of face movement takes you
+let GAIN = 3;
+const SENS_CHOICES = [['낮음', 2], ['보통', 3], ['높음', 4.5], ['아주 높음', 6]];
 const DRAW_TIME = 0.09;      // holster -> aimed animation
 const SAFE_X = 0.12;         // metres the head must be on the safe side when he fires
-const CENTER_X = 0.07;       // "in the middle" tolerance between rounds
+const CENTER_X = 0.08;       // "in the middle" tolerance between rounds
+const EARLY_X = 0.11;        // moving this far before the draw counts as jumping the gun
 const COWBOY_Z = 3.2;
 
 const cv = document.getElementById('game');
@@ -56,7 +70,32 @@ const startBtn = document.getElementById('start');
 const keysBtn = document.getElementById('keys');
 const descEl = document.getElementById('desc');
 const titleEl = overlay.querySelector('h1');
-descEl.innerHTML = descEl.innerHTML.replace('0.2초', `${REACT}초`);
+
+// ---------- options ----------
+const params = new URLSearchParams(location.search);
+try {
+  REACT = +localStorage.getItem('cowboy-react') || REACT;
+  GAIN = +localStorage.getItem('cowboy-gain') || GAIN;
+} catch {}
+if (+params.get('t')) REACT = +params.get('t');
+
+function chips(el, items, isOn, pick) {
+  const render = () => {
+    el.innerHTML = '';
+    for (const [label, val] of items) {
+      const b = document.createElement('button');
+      b.textContent = label;
+      if (isOn(val)) b.className = 'on';
+      b.onclick = () => { pick(val); render(); };
+      el.appendChild(b);
+    }
+  };
+  render();
+}
+chips(document.getElementById('reactOpts'), REACT_CHOICES.map(v => [`${v}초`, v]), v => v === REACT,
+  v => { REACT = v; try { localStorage.setItem('cowboy-react', v); } catch {} });
+chips(document.getElementById('sensOpts'), SENS_CHOICES, v => v === GAIN,
+  v => { GAIN = v; try { localStorage.setItem('cowboy-gain', v); } catch {} });
 
 let W = 0, H = 0, F = 0;
 function resize() {
@@ -109,7 +148,7 @@ function updateInput(dt) {
     if (res.detections.length) {
       const b = res.detections[0].boundingBox;
       rawFace = { x: (b.originX + b.width / 2) / video.videoWidth, y: (b.originY + b.height / 2) / video.videoHeight };
-      head.x = clamp((calib.x - rawFace.x) * 1.4, -0.6, 0.6);   // mirrored
+      head.x = clamp((calib.x - rawFace.x) * GAIN, -0.6, 0.6);   // mirrored
       head.y = clamp((calib.y - rawFace.y) * 1.0, -0.4, 0.3);
       faceSeen = true;
     } else {
@@ -235,7 +274,7 @@ function update(dt) {
     centerHold = Math.abs(head.x) < CENTER_X && faceSeen ? centerHold + dt : 0;
     if (centerHold > 0.4) newTense();
   } else if (state === 'tense') {
-    if (Math.abs(head.x) > CENTER_X * 1.6) { showMsg('움직이지 마!', '가운데로 돌아오세요'); toCenter(); return; }
+    if (Math.abs(head.x) > EARLY_X) { showMsg('움직이지 마!', '가운데로 돌아오세요'); toCenter(); return; }
     timer -= dt;
     if (twitchAt >= 0 && timer <= twitchAt) { twitch = 1; twitchAt = -1; }
     if (timer <= 0) startDraw();
@@ -245,7 +284,7 @@ function update(dt) {
   } else if (state === 'aimed') {
     aimedT += dt;
     if (escapedAt < 0 && head.x * -side > SAFE_X) escapedAt = aimedT;
-    if (aimedT >= REACT) fire();
+    if (aimedT >= REACT + (useCamera ? CAM_LAG : 0)) fire();
   } else if (state === 'gap') {
     timer -= dt;
     if (timer <= 0 && lives > 0) toCenter();
